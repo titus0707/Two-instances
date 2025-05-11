@@ -1,43 +1,20 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 
-class DerivTradingBot {
+class DerivTickAnalyzer {
     constructor() {
-        this.connections = new Map();
-        this.app_id = "1089";
-        this.api_token = "sEcAT5qfmp52HYX";
-        this.baseStake = 0.35;
-        this.currentStake = this.baseStake;
-        this.digitHistories = new Map();
-        this.isAnyTradePending = false;
-        this.excludedSymbols = new Set();
-        this.isTradingActive = false;
-        this.isRecovering = false;
-        this.activeTrades = new Map();
-        this.contractToTradeType = {};
-        this.totalProfit = 0;
-        this.martingaleMultiplier = 5.66;
-        this.takeProfitTarget = 20.00;
-        this.isRunning = true;
-        this.currentTradingSymbol = null;
-        this.patternReadySymbols = new Set();
+        this.ws = null;
+        this.app_id = "1089"; // Replace with your app ID
+        this.api_token = "sEcAT5qfmp52HYX"; // Replace with your API token
+        this.symbol = "R_75"; // Fixed symbol
+        this.tickCount = 5000; // Number of ticks to fetch
+        this.digitHistory = [];
+        this.logFile = 'tick_pattern_analysis_5th_digit.log';
 
-        this.symbols = [
-            "1HZ10V", "R_10", "1HZ25V", "R_25", "1HZ50V", "R_50",
-            "1HZ75V", "R_75", "1HZ100V", "R_100", "RDBEAR", "RDBULL",
-            "JD10", "JD25", "JD50", "JD75", "JD100"
-        ];
+        fs.writeFileSync(this.logFile, `Analysis of ${this.tickCount} ticks for ${this.symbol} - 3-digit (4/5) sequences with 5th digit outcome - Started ${new Date().toLocaleString()}\n\n`, 'utf8');
 
-        this.logFile = 'trading_log.log';
-        fs.writeFileSync(this.logFile, `Deriv Trading Bot - Started ${new Date().toLocaleString()}\nSymbols: ${this.symbols.join(', ')}\nStrategy: Wait for three 4s or 5s, then trade UNDER4/OVER5 on 45 or 54\n\n`, 'utf8');
-
-        this.symbols.forEach(symbol => {
-            this.digitHistories.set(symbol, []);
-            this.activeTrades.set(symbol, { under4: { status: null, profit: 0 }, over5: { status: null, profit: 0 } });
-        });
-
-        this.log(`Starting Deriv Trading Bot`);
-        this.log(`Tracking ${this.symbols.length} symbols`);
+        this.log(`Starting Deriv Tick Analyzer`);
+        this.log(`Fetching ${this.tickCount} ticks for ${this.symbol}`);
         this.run();
     }
 
@@ -45,206 +22,158 @@ class DerivTradingBot {
         const timestamp = new Date().toLocaleString();
         const logMessage = `[${timestamp}] ${message}`;
         console.log(logMessage);
-        if (toFile) fs.appendFileSync(this.logFile, `${logMessage}\n`, 'utf8');
+        if (toFile) {
+            fs.appendFileSync(this.logFile, `${logMessage}\n`, 'utf8');
+        }
     }
 
     async run() {
-        await Promise.all(this.symbols.map(symbol => this.connect(symbol)));
-        this.symbols.forEach(symbol => this.subscribeToTicks(symbol));
+        await this.connect();
+        await this.fetchHistory();
+        this.analyzeTicks();
+        this.ws.close();
     }
 
-    connect(symbol) {
+    connect() {
         return new Promise((resolve) => {
-            const ws = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${this.app_id}`);
-            this.connections.set(symbol, ws);
-
-            ws.on('open', () => {
-                this.authenticate(ws);
+            this.ws = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${this.app_id}`);
+            this.ws.on('open', () => {
+                this.authenticate();
                 resolve();
             });
-            ws.on('message', (data) => this.handleMessage(symbol, data));
-            ws.on('close', () => {
-                this.log(`Connection lost for ${symbol} - reconnecting...`);
-                this.connect(symbol);
-            });
-            ws.on('error', (error) => this.log(`WebSocket error for ${symbol}: ${error.message}`));
+            this.ws.on('message', (data) => this.handleMessage(data));
+            this.ws.on('close', () => this.log("WebSocket connection closed"));
+            this.ws.on('error', (error) => this.log(`WebSocket error: ${error.message}`));
         });
     }
 
-    authenticate(ws) {
-        ws.send(JSON.stringify({ authorize: this.api_token }));
+    authenticate() {
+        this.ws.send(JSON.stringify({ authorize: this.api_token }));
     }
 
-    subscribeToTicks(symbol) {
-        this.connections.get(symbol).send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
+    async fetchHistory() {
+        return new Promise((resolve) => {
+            this.historyResolve = resolve;
+            this.ws.send(JSON.stringify({
+                ticks_history: this.symbol,
+                count: this.tickCount,
+                end: "latest",
+                style: "ticks"
+            }));
+        });
     }
 
-    handleMessage(symbol, data) {
+    handleMessage(data) {
         const response = JSON.parse(data);
         switch (response.msg_type) {
             case "authorize":
-                this.log(`${symbol} - Successfully authorized`);
+                this.log("Authorized successfully");
                 break;
-            case "tick":
-                if (response.tick && response.tick.quote) {
-                    this.processTick(symbol, response.tick);
+            case "history":
+                if (this.historyResolve) {
+                    const digits = response.history.prices.map(price => {
+                        const priceStr = String(price).replace(/[^0-9]/g, '');
+                        return parseInt(priceStr.slice(-1));
+                    });
+                    this.digitHistory = digits;
+                    this.log(`Fetched ${digits.length} ticks`);
+                    this.historyResolve();
+                    this.historyResolve = null;
                 }
                 break;
-            case "buy":
-                this.handleBuyResponse(symbol, response);
-                break;
-            case "proposal_open_contract":
-                this.handleContractUpdate(symbol, response);
-                break;
             case "error":
-                this.log(`API Error for ${symbol}: ${response.error.message}`);
+                this.log(`API Error: ${response.error.message}`);
                 break;
         }
     }
 
-    processTick(symbol, tick) {
-        if (!this.isRunning) return;
+    analyzeTicks() {
+        if (this.digitHistory.length < 5) { // Adjusted to 5 since we need the 5th digit
+            this.log("Not enough tick data to analyze (need at least 5 ticks)");
+            return;
+        }
 
-        const quoteStr = String(tick.quote);
-        const lastDigit = parseInt(quoteStr.slice(-1));
-        const history = this.digitHistories.get(symbol);
-        history.push(lastDigit);
-        if (history.length > 3) history.shift();
-        this.log(`${symbol} - Last digit: ${lastDigit}`);
+        let sequencesFound = 0;
+        const outcomes = [];
+        const winStreaks = {};
+        const lossStreaks = {};
+        let currentWinStreak = 0;
+        let currentLossStreak = 0;
 
-        if (history.length >= 3) {
-            const lastThreeDigits = history.slice(-3);
-            const isThreePattern = lastThreeDigits.every(digit => digit === 4 || digit === 5) && 
-                                  lastThreeDigits.length === 3;
+        this.log("Detailed analysis of 3-digit (4/5) sequences with 5th digit outcome:", true);
 
-            if (isThreePattern && !this.patternReadySymbols.has(symbol)) {
-                this.patternReadySymbols.add(symbol);
-                this.log(`${symbol} - Three 4s or 5s detected: ${lastThreeDigits.join('-')} - Waiting for 45/54`);
-                return;
-            }
+        for (let i = 0; i < this.digitHistory.length - 4; i++) { // Adjusted to -4 for 5 digits
+            const first = this.digitHistory[i];
+            const second = this.digitHistory[i + 1];
+            const third = this.digitHistory[i + 2];
+            const fifth = this.digitHistory[i + 4]; // Use 5th digit instead of 4th
 
-            if (this.patternReadySymbols.has(symbol)) {
-                const lastTwoDigits = history.slice(-2);
-                const isTradePattern = (lastTwoDigits[0] === 4 && lastTwoDigits[1] === 5) || 
-                                      (lastTwoDigits[0] === 5 && lastTwoDigits[1] === 4);
+            // Check if first 3 digits are 4 or 5
+            if ((first === 4 || first === 5) &&
+                (second === 4 || second === 5) &&
+                (third === 4 || third === 5)) {
+                sequencesFound++;
+                const sequence = `${first}${second}${third}`;
+                const outcome = (fifth === 4 || fifth === 5) ? "Lost" : "Won"; // Outcome based on 5th digit
+                outcomes.push(outcome);
+                this.log(`Sequence ${sequence} at position ${i}-${i+2}, 5th digit ${fifth}: ${outcome}`, true);
 
-                if (isTradePattern && !this.isAnyTradePending) {
-                    const isExcluded = this.excludedSymbols.has(symbol);
-                    if (!isExcluded) {
-                        this.executeTrades(symbol, lastTwoDigits);
-                        this.patternReadySymbols.delete(symbol);
-                        this.isTradingActive = true;
-                        this.log(`${symbol} - Trading after three 4/5s then ${lastTwoDigits.join('-')}`);
+                // Track consecutive wins and losses
+                if (outcome === "Won") {
+                    currentWinStreak++;
+                    if (currentLossStreak > 0) {
+                        lossStreaks[currentLossStreak] = (lossStreaks[currentLossStreak] || 0) + 1;
+                        currentLossStreak = 0;
+                    }
+                } else { // Lost
+                    currentLossStreak++;
+                    if (currentWinStreak > 0) {
+                        winStreaks[currentWinStreak] = (winStreaks[currentWinStreak] || 0) + 1;
+                        currentWinStreak = 0;
                     }
                 }
             }
         }
-    }
 
-    executeTrades(symbol, lastTwoDigits) {
-        if (this.isAnyTradePending) {
-            this.log(`${symbol} - Skipping trade: Trade pending on ${this.currentTradingSymbol}`);
-            return;
+        // Record the last streak if it exists
+        if (currentWinStreak > 0) {
+            winStreaks[currentWinStreak] = (winStreaks[currentWinStreak] || 0) + 1;
+        }
+        if (currentLossStreak > 0) {
+            lossStreaks[currentLossStreak] = (lossStreaks[currentLossStreak] || 0) + 1;
         }
 
-        this.isAnyTradePending = true;
-        this.currentTradingSymbol = symbol;
-        const stake = this.currentStake;
-        const ws = this.connections.get(symbol);
+        // Summary
+        this.log("Summary of 3-digit (4/5) sequences with 5th digit outcome:", true);
+        this.log(`Total sequences found: ${sequencesFound} time(s)`, true);
+        const totalWins = outcomes.filter(o => o === "Won").length;
+        const totalLosses = outcomes.filter(o => o === "Lost").length;
+        this.log(`Won (5th digit not 4 or 5): ${totalWins} time(s)`, true);
+        this.log(`Lost (5th digit 4 or 5): ${totalLosses} time(s)`, true);
+        this.log(`Total sequences analyzed: ${totalWins + totalLosses}`, true);
+        this.log(`Percentage Won: ${totalWins + totalLosses > 0 ? ((totalWins / (totalWins + totalLosses)) * 100).toFixed(2) : 0}%`, true);
 
-        ws.send(JSON.stringify({
-            buy: 1,
-            subscribe: 1,
-            price: stake,
-            parameters: {
-                amount: stake,
-                basis: "stake",
-                contract_type: "DIGITUNDER",
-                currency: "USD",
-                duration: 1,
-                duration_unit: "t",
-                symbol: symbol,
-                barrier: "4"
-            },
-            passthrough: { trade_type: "under4" }
-        }));
-
-        ws.send(JSON.stringify({
-            buy: 1,
-            subscribe: 1,
-            price: stake,
-            parameters: {
-                amount: stake,
-                basis: "stake",
-                contract_type: "DIGITOVER",
-                currency: "USD",
-                duration: 1,
-                duration_unit: "t",
-                symbol: symbol,
-                barrier: "5"
-            },
-            passthrough: { trade_type: "over5" }
-        }));
-
-        this.log(`${symbol} - Placed trades after pattern: ${lastTwoDigits.join('-')} | Stake: $${stake.toFixed(2)}`, true);
-        this.log(`${symbol} - UNDER4 @4 | OVER5 @5`);
-    }
-
-    handleBuyResponse(symbol, response) {
-        if (response.error) {
-            this.log(`${symbol} - Trade error: ${response.error.message}`, true);
-            this.isAnyTradePending = false;
-            this.currentTradingSymbol = null;
-            return;
-        }
-        const tradeType = response.passthrough.trade_type;
-        this.contractToTradeType[response.buy.contract_id] = tradeType;
-        this.log(`${symbol} - ${tradeType.toUpperCase()} contract purchased`);
-    }
-
-    handleContractUpdate(symbol, response) {
-        const contract = response.proposal_open_contract;
-        if (!contract.is_sold) return;
-
-        const tradeType = this.contractToTradeType[contract.contract_id];
-        if (!tradeType) return;
-
-        const profit = parseFloat(contract.profit);
-        this.totalProfit += profit;
-        const trades = this.activeTrades.get(symbol);
-        trades[tradeType].status = contract.status;
-        trades[tradeType].profit = profit;
-
-        this.log(`${symbol} - ${tradeType.toUpperCase()} ${contract.status.toUpperCase()}: $${profit.toFixed(2)}`, true);
-
-        if (trades.under4.status && trades.over5.status) {
-            const bothLost = trades.under4.status === "lost" && trades.over5.status === "lost";
-
-            if (bothLost) {
-                this.excludedSymbols.add(symbol);
-                this.currentStake = Number((this.currentStake * this.martingaleMultiplier).toFixed(2));
-                this.isRecovering = true;
-                this.log(`${symbol} - ❌ Both trades lost | Excluded symbol | New stake: $${this.currentStake.toFixed(2)} | Recovery on any symbol`, true);
-            } else {
-                this.currentStake = this.baseStake;
-                this.isRecovering = false;
-                this.log(`${symbol} - ✅ Reset stake to base: $${this.baseStake.toFixed(2)}`, true);
+        // Consecutive Wins and Losses Summary
+        this.log("\nConsecutive Wins Summary:", true);
+        if (Object.keys(winStreaks).length === 0) {
+            this.log("No consecutive win streaks found", true);
+        } else {
+            for (const [length, count] of Object.entries(winStreaks)) {
+                this.log(`Win streaks of length ${length}: ${count} time(s)`, true);
             }
-
-            this.log(`${symbol} - 📊 Total Profit: $${this.totalProfit.toFixed(2)}`, true);
-
-            if (this.totalProfit >= this.takeProfitTarget) {
-                this.log(`🎯 Target reached! Stopping trading. Total Profit: $${this.totalProfit.toFixed(2)}`, true);
-                this.isRunning = false;
-            }
-
-            trades.under4.status = null;
-            trades.over5.status = null;
-            this.isAnyTradePending = false;
-            this.currentTradingSymbol = null;
-            this.log(`${symbol} - Trade results processed`);
         }
+
+        this.log("\nConsecutive Losses Summary:", true);
+        if (Object.keys(lossStreaks).length === 0) {
+            this.log("No consecutive loss streaks found", true);
+        } else {
+            for (const [length, count] of Object.entries(lossStreaks)) {
+                this.log(`Loss streaks of length ${length}: ${count} time(s)`, true);
+            }
+        }
+
+        this.log(`Detailed analysis saved to ${this.logFile}`);
     }
 }
 
-new DerivTradingBot();
+new DerivTickAnalyzer();
